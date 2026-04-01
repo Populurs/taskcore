@@ -39,11 +39,12 @@ type TaskDealer struct {
 	sem       chan struct{}
 	dc        DealerConfig
 	wg        sync.WaitGroup // 全局 WaitGroup，跟踪所有正在处理的 target
+	cancels   sync.Map       // taskKey -> context.CancelFunc
 
 	// 并发监控指标
-	activeTargets   atomic.Int64 // 当前正在处理的target数
-	completedCount  atomic.Int64 // 已完成的target数（全局累计）
-	peakConcurrent  atomic.Int64 // 峰值并发数
+	activeTargets  atomic.Int64 // 当前正在处理的target数
+	completedCount atomic.Int64 // 已完成的target数（全局累计）
+	peakConcurrent atomic.Int64 // 峰值并发数
 }
 
 func InitDealer(baseConf *config.BaseConfig, logger *log.Logger, handler TaskHandler, dc DealerConfig) (*TaskDealer, error) {
@@ -95,6 +96,11 @@ func (d *TaskDealer) SubscribeEvent() error {
 			return err
 		}
 	}
+	if d.conf.TopicJobStop != "" {
+		if err := d.eb.Subscribe(context.Background(), d.conf.TopicJobStop, d.newStopHandler()); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -109,6 +115,34 @@ func (d *TaskDealer) newMessageHandler() eventbus.EventHandler {
 				zap.Error(err),
 			)
 			return nil
+		}
+		return nil
+	}
+}
+
+func (d *TaskDealer) newStopHandler() eventbus.EventHandler {
+	return func(eventID string, payload []byte, metadata map[string]string) error {
+		eventMeta, err := model.MapToEventMetadata(metadata)
+		if err != nil {
+			d.logger.Error("stop handler: failed to parse metadata",
+				zap.String("event_id", eventID),
+				zap.Any("metadata", metadata),
+				zap.Error(err),
+			)
+			return nil
+		}
+		taskKey := model.TaskKey(eventMeta)
+		if cancelFn, ok := d.cancels.LoadAndDelete(taskKey); ok {
+			cancelFn.(context.CancelFunc)()
+			d.logger.Info("task cancelled by stop event",
+				zap.String("task_key", taskKey),
+				zap.String("event_id", eventID),
+			)
+		} else {
+			d.logger.Warn("stop event received but no active task found",
+				zap.String("task_key", taskKey),
+				zap.String("event_id", eventID),
+			)
 		}
 		return nil
 	}
@@ -154,7 +188,11 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 		return fmt.Errorf("oss_path is empty")
 	}
 
-	d.logger.Info("start read OSS", zap.String("bucket", bucket), zap.String("object_key", objectKey))
+	taskKey := model.TaskKey(&metadata)
+	ctx, cancel := context.WithCancel(ctx)
+	d.cancels.Store(taskKey, cancel)
+
+	d.logger.Info("start read OSS", zap.String("bucket", bucket), zap.String("object_key", objectKey), zap.String("task_key", taskKey))
 
 	req := &oss.GetObjectRequest{
 		Bucket: &bucket,
@@ -174,6 +212,9 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 	flushRelayShard := func(buf []string) error {
 		if len(buf) == 0 {
 			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		localID := int(shardSeq.Add(1) - 1)
 		shardPath := fmt.Sprintf("%s/%d", inputShardPath, localID)
@@ -233,10 +274,25 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 	// 在后台 goroutine 中分发并处理所有 target
 	// 信号量 d.sem 是全局共享的，确保跨所有消息的总并发数受控
 	go func() {
+		defer func() {
+			d.cancels.Delete(taskKey)
+			cancel()
+		}()
+
 		var msgWg sync.WaitGroup
 
 		for _, target := range targets {
-			d.sem <- struct{}{} // 全局信号量，跨所有消息控制总并发数
+			if ctx.Err() != nil {
+				d.logger.Info("task cancelled, skip remaining targets", zap.String("task_key", taskKey))
+				break
+			}
+			// 使用 select 获取信号量，支持取消
+			select {
+			case d.sem <- struct{}{}:
+			case <-ctx.Done():
+				d.logger.Info("task cancelled while waiting for semaphore", zap.String("task_key", taskKey))
+				goto done
+			}
 			msgWg.Add(1)
 			d.wg.Add(1)
 			go func(t string) {
@@ -254,6 +310,10 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 					msgWg.Done()
 					d.wg.Done()
 				}()
+
+				if ctx.Err() != nil {
+					return
+				}
 
 				current := d.activeTargets.Add(1)
 				// 更新峰值并发
@@ -279,6 +339,10 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 					return
 				}
 
+				if ctx.Err() != nil {
+					return
+				}
+
 				cleaned := make([]string, 0, len(results))
 				for _, r := range results {
 					r = strings.TrimSpace(r)
@@ -299,6 +363,7 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 				}
 			}(target)
 		}
+	done:
 
 		msgWg.Wait()
 		d.logger.Info("all targets processed",

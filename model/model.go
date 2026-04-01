@@ -93,6 +93,10 @@ func MapToEventMetadata(m map[string]string) (*EventMetadata, error) {
 	return em, nil
 }
 
+func TaskKey(metadata *EventMetadata) string {
+	return fmt.Sprintf("%d-%d", metadata.TaskID, metadata.WorkTaskID)
+}
+
 func EventMetadataToMap(em *EventMetadata) map[string]string {
 	if em == nil {
 		return map[string]string{}

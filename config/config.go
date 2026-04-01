@@ -6,15 +6,16 @@ const (
 )
 
 type BaseConfig struct {
-	Rabbitmq                 Rabbitmq  `mapstructure:"rabbitmq" json:"rabbitmq" yaml:"rabbitmq"`
-	Log                      LogConfig `mapstructure:"log" json:"log" yaml:"log"`
+	Rabbitmq                 Rabbitmq   `mapstructure:"rabbitmq" json:"rabbitmq" yaml:"rabbitmq"`
+	Log                      LogConfig  `mapstructure:"log" json:"log" yaml:"log"`
 	Data                     DataConfig `mapstructure:"data" json:"data" yaml:"data"`
-	AliyunOSS                AliyunOSS `mapstructure:"aliyun-oss" json:"aliyun-oss" yaml:"aliyun-oss"`
-	TopicJobStart            string   `mapstructure:"topic_job_start" json:"topic_job_start" yaml:"topic_job_start"`
-	TopicDependencyCompleted []string `mapstructure:"topic_dep_completed" json:"topic_dep_completed" yaml:"topic_dep_completed"`
-	TopicWhoRelayOn          []string `mapstructure:"topic_who_relay_on" json:"topic_who_relay_on" yaml:"topic_who_relay_on"`
-	Concurrent               int      `mapstructure:"concurrent" json:"concurrent" yaml:"concurrent"`
-	RelayShardMaxItems       int      `mapstructure:"relay_shard_max_items" json:"relay_shard_max_items" yaml:"relay_shard_max_items"`
+	AliyunOSS                AliyunOSS  `mapstructure:"aliyun-oss" json:"aliyun-oss" yaml:"aliyun-oss"`
+	TopicJobStart            string     `mapstructure:"topic_job_start" json:"topic_job_start" yaml:"topic_job_start"`
+	TopicDependencyCompleted []string   `mapstructure:"topic_dep_completed" json:"topic_dep_completed" yaml:"topic_dep_completed"`
+	TopicWhoRelayOn          []string   `mapstructure:"topic_who_relay_on" json:"topic_who_relay_on" yaml:"topic_who_relay_on"`
+	TopicJobStop             string     `mapstructure:"topic_job_stop" json:"topic_job_stop" yaml:"topic_job_stop"`
+	Concurrent               int        `mapstructure:"concurrent" json:"concurrent" yaml:"concurrent"`
+	RelayShardMaxItems       int        `mapstructure:"relay_shard_max_items" json:"relay_shard_max_items" yaml:"relay_shard_max_items"`
 }
 
 func (c *BaseConfig) ApplyBaseDefaults() {
