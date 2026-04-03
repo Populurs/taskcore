@@ -1,5 +1,7 @@
 package config
 
+import "time"
+
 const (
 	WebDB = "web"
 	AsmDB = "asm"
@@ -47,8 +49,18 @@ type LogConfig struct {
 	Compress    bool   `yaml:"compress" mapstructure:"compress"`
 }
 
+type RedisConfig struct {
+	Addr         string        `mapstructure:"addr" yaml:"addr"`
+	Password     string        `mapstructure:"password" yaml:"password"`
+	DB           int           `mapstructure:"db" yaml:"db"`
+	ReadTimeout  time.Duration `mapstructure:"read_timeout" yaml:"read_timeout"`
+	WriteTimeout time.Duration `mapstructure:"write_timeout" yaml:"write_timeout"`
+	JobTTL       time.Duration `mapstructure:"job_ttl" yaml:"job_ttl"`
+}
+
 type DataConfig struct {
-	DB DBConfig `yaml:"db" mapstructure:"db"`
+	DB    DBConfig    `yaml:"db" mapstructure:"db"`
+	Redis RedisConfig `yaml:"redis" mapstructure:"redis"`
 }
 
 type DBConfig struct {

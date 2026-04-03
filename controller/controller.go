@@ -40,6 +40,7 @@ type TaskDealer struct {
 	dc        DealerConfig
 	wg        sync.WaitGroup // 全局 WaitGroup，跟踪所有正在处理的 target
 	cancels   sync.Map       // taskKey -> context.CancelFunc
+	tracker   *RedisTracker  // nil = Redis tracking disabled
 
 	// 并发监控指标
 	activeTargets  atomic.Int64 // 当前正在处理的target数
@@ -71,6 +72,13 @@ func InitDealer(baseConf *config.BaseConfig, logger *log.Logger, handler TaskHan
 		concurrency = 1
 	}
 
+	var tracker *RedisTracker
+	tracker, err = NewRedisTracker(baseConf.Data.Redis, dc.ModuleName, logger)
+	if err != nil {
+		logger.Warn("Redis tracker disabled", zap.Error(err))
+		tracker = nil
+	}
+
 	return &TaskDealer{
 		eb:        eb,
 		ossClient: oss.NewClient(ossCfg),
@@ -79,6 +87,7 @@ func InitDealer(baseConf *config.BaseConfig, logger *log.Logger, handler TaskHan
 		handler:   handler,
 		sem:       make(chan struct{}, concurrency),
 		dc:        dc,
+		tracker:   tracker,
 	}, nil
 }
 
@@ -194,6 +203,15 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 
 	d.logger.Info("start read OSS", zap.String("bucket", bucket), zap.String("object_key", objectKey), zap.String("task_key", taskKey))
 
+	// Redis: register this module and track shard
+	if d.tracker != nil {
+		d.tracker.RegisterModule(metadata.WorkTaskID)
+		isHead, _ := d.tracker.IsHeadModule(metadata.WorkTaskID)
+		if !isHead {
+			d.tracker.IncrTotal(metadata.WorkTaskID)
+		}
+	}
+
 	req := &oss.GetObjectRequest{
 		Bucket: &bucket,
 		Key:    &objectKey,
@@ -281,6 +299,7 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 
 		var msgWg sync.WaitGroup
 
+	loop:
 		for _, target := range targets {
 			if ctx.Err() != nil {
 				d.logger.Info("task cancelled, skip remaining targets", zap.String("task_key", taskKey))
@@ -291,7 +310,7 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			case d.sem <- struct{}{}:
 			case <-ctx.Done():
 				d.logger.Info("task cancelled while waiting for semaphore", zap.String("task_key", taskKey))
-				goto done
+				break loop
 			}
 			msgWg.Add(1)
 			d.wg.Add(1)
@@ -363,7 +382,6 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 				}
 			}(target)
 		}
-	done:
 
 		msgWg.Wait()
 		d.logger.Info("all targets processed",
@@ -375,6 +393,26 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			zap.Int("sem_capacity", d.conf.Concurrent),
 			zap.Duration("total_elapsed", time.Since(startTime)),
 		)
+
+		// Redis: mark shard done and check completion
+		if d.tracker != nil {
+			completed, shardErr := d.tracker.OnShardDone(metadata.WorkTaskID)
+			if shardErr != nil {
+				d.logger.Error("RedisTracker.OnShardDone failed",
+					zap.Uint32("work_task_id", metadata.WorkTaskID),
+					zap.Error(shardErr),
+				)
+			} else if completed {
+				d.tracker.SetStatus(metadata.WorkTaskID, "completed")
+			}
+			// Notify downstream modules that this upstream has finished relaying
+			if hasRelay {
+				downstreams := extractDownstreamModules(d.conf.TopicWhoRelayOn, payload)
+				if len(downstreams) > 0 {
+					d.tracker.MarkUpstreamDone(metadata.WorkTaskID, downstreams)
+				}
+			}
+		}
 	}()
 
 	return nil
@@ -426,4 +464,21 @@ func extractShardPath(ossPath string) string {
 		}
 	}
 	return "0"
+}
+
+// extractDownstreamModules extracts module names from relay topics.
+// Topic format: "subdomain.discover.start" → module "subdomain.discover"
+func extractDownstreamModules(topics []string, payload model.TaskPayload) []string {
+	var modules []string
+	for _, topic := range topics {
+		idx := strings.LastIndex(topic, ".")
+		if idx <= 0 {
+			continue
+		}
+		moduleName := topic[:idx]
+		if payload.IsModuleEnabled(moduleName) {
+			modules = append(modules, moduleName)
+		}
+	}
+	return modules
 }
