@@ -227,6 +227,11 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 	inputShardPath := extractShardPath(objectKey)
 	var shardSeq atomic.Int64
 
+	// Track per-downstream shard counts for MarkUpstreamDone verification
+	var downstreamShardMu sync.Mutex
+	downstreamShardCounts := make(map[string]int64) // downstream module → number of shards relayed
+	upstreamRegistered := make(map[string]bool)     // downstream module → whether RegisterUpstream was called
+
 	flushRelayShard := func(buf []string) error {
 		if len(buf) == 0 {
 			return nil
@@ -256,6 +261,17 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			if !payload.IsModuleEnabled(downstreamModule) {
 				continue
 			}
+
+			// Register this module as upstream of the downstream (once per downstream)
+			downstreamShardMu.Lock()
+			if d.tracker != nil && !upstreamRegistered[downstreamModule] {
+				upstreamRegistered[downstreamModule] = true
+				downstreamShardMu.Unlock()
+				d.tracker.RegisterUpstream(metadata.WorkTaskID, downstreamModule)
+			} else {
+				downstreamShardMu.Unlock()
+			}
+
 			nextPayload, _ := json.Marshal(model.TaskPayload{
 				OssPath:        obKey,
 				Options:        payload.Options,
@@ -264,6 +280,11 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			})
 			if pubErr := d.eb.Publish(ctx, nextTopic, nextPayload, model.EventMetadataToMap(&metadata)); pubErr != nil {
 				d.logger.Error("publish relay event error", zap.String("topic", nextTopic), zap.Error(pubErr))
+			} else {
+				// Only count successfully published shards
+				downstreamShardMu.Lock()
+				downstreamShardCounts[downstreamModule]++
+				downstreamShardMu.Unlock()
 			}
 		}
 		return nil
@@ -407,9 +428,14 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			}
 			// Notify downstream modules that this upstream has finished relaying
 			if hasRelay {
-				downstreams := extractDownstreamModules(d.conf.TopicWhoRelayOn, payload)
-				if len(downstreams) > 0 {
-					d.tracker.MarkUpstreamDone(metadata.WorkTaskID, downstreams)
+				downstreamShardMu.Lock()
+				counts := make(map[string]int64, len(downstreamShardCounts))
+				for k, v := range downstreamShardCounts {
+					counts[k] = v
+				}
+				downstreamShardMu.Unlock()
+				if len(counts) > 0 {
+					d.tracker.MarkUpstreamDone(metadata.WorkTaskID, counts)
 				}
 			}
 		}
@@ -464,21 +490,4 @@ func extractShardPath(ossPath string) string {
 		}
 	}
 	return "0"
-}
-
-// extractDownstreamModules extracts module names from relay topics.
-// Topic format: "subdomain.discover.start" → module "subdomain.discover"
-func extractDownstreamModules(topics []string, payload model.TaskPayload) []string {
-	var modules []string
-	for _, topic := range topics {
-		idx := strings.LastIndex(topic, ".")
-		if idx <= 0 {
-			continue
-		}
-		moduleName := topic[:idx]
-		if payload.IsModuleEnabled(moduleName) {
-			modules = append(modules, moduleName)
-		}
-	}
-	return modules
 }

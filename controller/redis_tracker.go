@@ -112,7 +112,8 @@ func (rt *RedisTracker) IncrTotal(workTaskID uint32) error {
 
 // OnShardDone increments shards:done and checks whether the module is complete.
 // For head modules: completed when done == total.
-// For downstream modules: completed when done == total AND at least one upstream_done marker exists.
+// For downstream modules: completed when done == total AND all upstreams have marked done
+// AND the sum of upstream shard counts equals total (ensuring all shards have arrived).
 func (rt *RedisTracker) OnShardDone(workTaskID uint32) (completed bool, err error) {
 	ctx := context.Background()
 
@@ -144,7 +145,7 @@ func (rt *RedisTracker) OnShardDone(workTaskID uint32) (completed bool, err erro
 	if isHead {
 		return true, nil
 	}
-	return rt.hasUpstreamDone(workTaskID)
+	return rt.allUpstreamsDone(workTaskID)
 }
 
 // SetStatus sets the module's status key.
@@ -154,14 +155,15 @@ func (rt *RedisTracker) SetStatus(workTaskID uint32, status string) error {
 }
 
 // MarkUpstreamDone is called by the upstream module after all its targets have been processed.
-// It sets an upstream_done flag on each downstream module, then checks if the downstream
-// is already complete (done == total) and marks it completed if so.
-func (rt *RedisTracker) MarkUpstreamDone(workTaskID uint32, downstreamModules []string) error {
+// It sets an upstream_done flag on each downstream module with the shard count as value,
+// then checks if the downstream is already complete and marks it completed if so.
+// shardCounts maps downstream module name → number of shards this upstream relayed to it.
+func (rt *RedisTracker) MarkUpstreamDone(workTaskID uint32, shardCounts map[string]int64) error {
 	ctx := context.Background()
 
-	for _, downstream := range downstreamModules {
+	for downstream, count := range shardCounts {
 		flagKey := rt.upstreamDoneKey(workTaskID, downstream, rt.moduleName)
-		if err := rt.rdb.Set(ctx, flagKey, "1", rt.ttl).Err(); err != nil {
+		if err := rt.rdb.Set(ctx, flagKey, strconv.FormatInt(count, 10), rt.ttl).Err(); err != nil {
 			rt.logger.Error("RedisTracker.MarkUpstreamDone set flag failed",
 				zap.Uint32("work_task_id", workTaskID),
 				zap.String("downstream", downstream),
@@ -170,24 +172,39 @@ func (rt *RedisTracker) MarkUpstreamDone(workTaskID uint32, downstreamModules []
 			continue
 		}
 
-		// Check if downstream is now complete (done == total and upstream_done exists)
+		// Check if downstream is now complete
 		rt.tryCompleteDownstream(ctx, workTaskID, downstream)
 	}
 	return nil
 }
 
-// tryCompleteDownstream checks if a downstream module has done==total and sets completed if so.
+// tryCompleteDownstream checks if a downstream module has:
+// 1. All upstreams marked done
+// 2. Sum of upstream shard counts == shards:total (all shards arrived)
+// 3. shards:done == shards:total (all shards processed)
+// Only then marks the downstream as completed.
 func (rt *RedisTracker) tryCompleteDownstream(ctx context.Context, workTaskID uint32, downstream string) {
+	// 1. Check all upstreams are done and get expected total
+	expectedTotal, allDone, err := rt.expectedTotalFromUpstreams(ctx, workTaskID, downstream)
+	if err != nil || !allDone {
+		return
+	}
+
+	// 2. Check shards:total matches expected (all shards have arrived at downstream)
 	totalStr, err := rt.rdb.Get(ctx, fmt.Sprintf("wt:%d:%s:shards:total", workTaskID, downstream)).Result()
 	if err != nil {
 		return
 	}
+	total, _ := strconv.ParseInt(totalStr, 10, 64)
+	if total < expectedTotal {
+		return // not all shards have been received yet
+	}
+
+	// 3. Check shards:done == shards:total (all shards processed)
 	doneStr, err := rt.rdb.Get(ctx, fmt.Sprintf("wt:%d:%s:shards:done", workTaskID, downstream)).Result()
 	if err != nil {
 		return
 	}
-
-	total, _ := strconv.ParseInt(totalStr, 10, 64)
 	done, _ := strconv.ParseInt(doneStr, 10, 64)
 	if total <= 0 || done < total {
 		return
@@ -209,17 +226,91 @@ func (rt *RedisTracker) tryCompleteDownstream(ctx context.Context, workTaskID ui
 	}
 }
 
-// hasUpstreamDone checks if at least one upstream_done marker exists for this module.
-func (rt *RedisTracker) hasUpstreamDone(workTaskID uint32) (bool, error) {
+// RegisterUpstream registers the current module as an upstream of a downstream module.
+// Called when first relaying a shard to a downstream, so the downstream knows all its upstreams.
+func (rt *RedisTracker) RegisterUpstream(workTaskID uint32, downstream string) error {
 	ctx := context.Background()
-	pattern := fmt.Sprintf("wt:%d:%s:upstream_done:*", workTaskID, rt.moduleName)
+	key := rt.upstreamsKey(workTaskID, downstream)
+	pipe := rt.rdb.Pipeline()
+	pipe.SAdd(ctx, key, rt.moduleName)
+	pipe.Expire(ctx, key, rt.ttl)
+	_, err := pipe.Exec(ctx)
+	return err
+}
 
-	var cursor uint64
-	keys, cursor, err := rt.rdb.Scan(ctx, cursor, pattern, 1).Result()
+// allUpstreamsDone checks that ALL registered upstreams have marked done for this module.
+// Returns false if no upstreams are registered (safety: don't accidentally mark complete).
+func (rt *RedisTracker) allUpstreamsDone(workTaskID uint32) (bool, error) {
+	ctx := context.Background()
+	upstreamsKey := rt.upstreamsKey(workTaskID, rt.moduleName)
+	upstreams, err := rt.rdb.SMembers(ctx, upstreamsKey).Result()
 	if err != nil {
 		return false, err
 	}
-	return len(keys) > 0 || cursor != 0, nil
+	if len(upstreams) == 0 {
+		return false, nil
+	}
+	for _, up := range upstreams {
+		flagKey := rt.upstreamDoneKey(workTaskID, rt.moduleName, up)
+		exists, err := rt.rdb.Exists(ctx, flagKey).Result()
+		if err != nil {
+			return false, err
+		}
+		if exists == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// allUpstreamsDoneFor is like allUpstreamsDone but for an arbitrary downstream module name.
+func (rt *RedisTracker) allUpstreamsDoneFor(ctx context.Context, workTaskID uint32, downstream string) (bool, error) {
+	upstreamsKey := rt.upstreamsKey(workTaskID, downstream)
+	upstreams, err := rt.rdb.SMembers(ctx, upstreamsKey).Result()
+	if err != nil {
+		return false, err
+	}
+	if len(upstreams) == 0 {
+		return false, nil
+	}
+	for _, up := range upstreams {
+		flagKey := rt.upstreamDoneKey(workTaskID, downstream, up)
+		exists, err := rt.rdb.Exists(ctx, flagKey).Result()
+		if err != nil {
+			return false, err
+		}
+		if exists == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// expectedTotalFromUpstreams sums the shard counts stored in all upstream_done keys for a downstream.
+// Returns (sum, true) if all upstreams are done, or (0, false) if any upstream hasn't marked done yet.
+func (rt *RedisTracker) expectedTotalFromUpstreams(ctx context.Context, workTaskID uint32, downstream string) (int64, bool, error) {
+	upstreamsKey := rt.upstreamsKey(workTaskID, downstream)
+	upstreams, err := rt.rdb.SMembers(ctx, upstreamsKey).Result()
+	if err != nil {
+		return 0, false, err
+	}
+	if len(upstreams) == 0 {
+		return 0, false, nil
+	}
+	var sum int64
+	for _, up := range upstreams {
+		flagKey := rt.upstreamDoneKey(workTaskID, downstream, up)
+		val, err := rt.rdb.Get(ctx, flagKey).Result()
+		if err == redis.Nil {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		n, _ := strconv.ParseInt(val, 10, 64)
+		sum += n
+	}
+	return sum, true, nil
 }
 
 // Redis key helpers — format matches scheduler/internal/rediskeys exactly.
@@ -242,4 +333,8 @@ func (rt *RedisTracker) shardsDoneKey(workTaskID uint32) string {
 
 func (rt *RedisTracker) upstreamDoneKey(workTaskID uint32, downstream, upstream string) string {
 	return fmt.Sprintf("wt:%d:%s:upstream_done:%s", workTaskID, downstream, upstream)
+}
+
+func (rt *RedisTracker) upstreamsKey(workTaskID uint32, downstream string) string {
+	return fmt.Sprintf("wt:%d:%s:upstreams", workTaskID, downstream)
 }
