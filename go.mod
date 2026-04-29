@@ -1,6 +1,8 @@
 module github.com/Populurs/taskcore
 
-go 1.25.5
+go 1.26.1
+
+go 1.26.1
 
 require (
 	github.com/Populurs/eventbus v0.2.0
