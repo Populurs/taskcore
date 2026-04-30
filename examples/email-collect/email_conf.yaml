@@ -1,0 +1,95 @@
+# RabbitMQ 配置
+rabbitmq:
+  url: "amqp://guest:guest@localhost:5672/"
+  vhost: "/"
+  prefetch_count: 10
+
+# 日志配置
+log:
+  log_level: "info"
+  mode: "development"
+  encoding: "json"
+  log_file_name: "email-collect.log"
+  max_backups: 30
+  max_age: 7
+  max_size: 100
+  compress: true
+
+# 数据库配置
+data:
+  # Web 数据库
+  db:
+    web:
+      driver: "mysql"
+      dsn: "root:password@tcp(localhost:3306)/email_db?charset=utf8mb4&parseTime=True&loc=Local"
+      max_idle_conns: 10
+      max_open_conns: 100
+      conn_max_lifetime: 3600
+    # ASM 数据库
+    asm:
+      driver: "mysql"
+      dsn: "root:password@tcp(localhost:3306)/email_asm?charset=utf8mb4&parseTime=True&loc=Local"
+      max_idle_conns: 10
+      max_open_conns: 100
+      conn_max_lifetime: 3600
+
+# Redis 配置（可选）
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+  read_timeout: 5s
+  write_timeout: 5s
+  job_ttl: 1h
+
+# OSS 配置
+aliyun-oss:
+  endpoint: "oss-cn-hangzhou.aliyuncs.com"
+  region: "cn-hangzhou"
+  access-key-id: "your-access-key-id"
+  access-key-secret: "your-access-key-secret"
+  bucket-name: "your-bucket-name"
+  bucket-url: "https://your-bucket.oss-cn-hangzhou.aliyuncs.com"
+  base-path: "stream/email"
+  disable-ssl: false
+  use-internal-endpoint: false
+
+# 主题配置
+topic_job_start: "email.collect.start"
+topic_dep_completed: []
+topic_job_stop: "email.collect.stop"
+topic_who_relay_on: []
+topic_result_feedback: []
+
+# 并发配置
+concurrent: 5
+relay_shard_max_items: 100
+enable_result_feedback: false
+
+# 邮箱收集模块配置
+email_collect:
+  # GitHub 数据源配置
+  github:
+    enabled: true
+    token: "your-github-token"
+    search_size: 50
+
+  # Bing 数据源配置
+  bing:
+    enabled: true
+    proxy: ""
+    search_size: 50
+
+  # Sogou 数据源配置
+  sogou:
+    enabled: true
+    search_size: 50
+
+  # 0zone 数据源配置
+  0zone:
+    enabled: true
+    token: "your-0zone-token"
+
+  # 收集配置
+  max_retry_count: 3
+  request_timeout: 10
