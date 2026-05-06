@@ -111,3 +111,39 @@ func EventMetadataToMap(em *EventMetadata) map[string]string {
 		"company_name": em.CompanyName,
 	}
 }
+
+func ResultKeyFromMetadata(metadata *EventMetadata) string {
+	return fmt.Sprintf("%d-%d", metadata.TaskID, metadata.WorkTaskID)
+}
+
+func JoinJSONStrings(jsonStrs []string) ([]byte, error) {
+	if len(jsonStrs) == 0 {
+		return []byte("[]"), nil
+	}
+
+	var builder strings.Builder
+	builder.WriteRune('[')
+
+	// 连接所有JSON字符串，用逗号分隔
+	for i, jsonStr := range jsonStrs {
+		if i > 0 {
+			builder.WriteRune(',')
+		}
+		builder.WriteString(jsonStr)
+	}
+
+	builder.WriteRune(']')
+
+	// 将结果转换为[]byte
+	result := []byte(builder.String())
+
+	// 验证生成的JSON是否有效
+	/*
+		var temp interface{}
+		if err := json.Unmarshal(result, &temp); err != nil {
+			return nil, fmt.Errorf("生成的JSON无效: %w", err)
+		}
+	*/
+
+	return result, nil
+}

@@ -2,8 +2,6 @@ module github.com/Populurs/taskcore
 
 go 1.26.1
 
-go 1.26.1
-
 require (
 	github.com/Populurs/eventbus v0.2.0
 	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.4.0

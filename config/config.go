@@ -15,9 +15,12 @@ type BaseConfig struct {
 	TopicJobStart            string     `mapstructure:"topic_job_start" json:"topic_job_start" yaml:"topic_job_start"`
 	TopicDependencyCompleted []string   `mapstructure:"topic_dep_completed" json:"topic_dep_completed" yaml:"topic_dep_completed"`
 	TopicWhoRelayOn          []string   `mapstructure:"topic_who_relay_on" json:"topic_who_relay_on" yaml:"topic_who_relay_on"`
+	ModulesRelayOn           []string   `mapstructure:"modules_relay_on" json:"modules_relay_on" yaml:"modules_relay_on"`
 	TopicJobStop             string     `mapstructure:"topic_job_stop" json:"topic_job_stop" yaml:"topic_job_stop"`
 	Concurrent               int        `mapstructure:"concurrent" json:"concurrent" yaml:"concurrent"`
 	RelayShardMaxItems       int        `mapstructure:"relay_shard_max_items" json:"relay_shard_max_items" yaml:"relay_shard_max_items"`
+	TopicResultFeedback      []string   `mapstructure:"topic_result_feedback" json:"topic_result_feedback" yaml:"topic_result_feedback"`
+	EnableResultFeedback     bool       `mapstructure:"enable_result_feedback" json:"enable_result_feedback" yaml:"enable_result_feedback"`
 }
 
 func (c *BaseConfig) ApplyBaseDefaults() {
