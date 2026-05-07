@@ -246,17 +246,13 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			)
 		}
 
-		var err error
-		if d.tracker.IsHeadModule() {
-			err = d.tracker.SetHeadTotal(metadata.WorkTaskID, 1)
-		} else {
-			err = d.tracker.IncrTotal(metadata.WorkTaskID)
-		}
-		if err != nil {
-			d.logger.Error("RedisTracker total update failed",
-				zap.Uint32("work_task_id", metadata.WorkTaskID),
-				zap.Error(err),
-			)
+		if !d.tracker.IsHeadModule() {
+			if err := d.tracker.IncrTotal(metadata.WorkTaskID); err != nil {
+				d.logger.Error("RedisTracker total update failed",
+					zap.Uint32("work_task_id", metadata.WorkTaskID),
+					zap.Error(err),
+				)
+			}
 		}
 	}
 

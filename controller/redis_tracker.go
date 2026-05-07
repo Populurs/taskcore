@@ -91,10 +91,6 @@ func (rt *RedisTracker) IsHeadModule() bool {
 	return len(rt.modulesRelayOn) == 0
 }
 
-func (rt *RedisTracker) SetHeadTotal(workTaskID uint32, total int64) error {
-	return rt.incrTotal(workTaskID, total)
-}
-
 func (rt *RedisTracker) IncrTotal(workTaskID uint32) error {
 	return rt.incrTotal(workTaskID, 1)
 }
