@@ -246,7 +246,7 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			)
 		}
 
-		if !d.tracker.IsHeadModule() {
+		if !payload.IsHeadModule {
 			if err := d.tracker.IncrTotal(metadata.WorkTaskID); err != nil {
 				d.logger.Error("RedisTracker total update failed",
 					zap.Uint32("work_task_id", metadata.WorkTaskID),
@@ -319,6 +319,7 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			nextPayload, _ := json.Marshal(model.TaskPayload{
 				OssPath:        obKey,
 				Options:        payload.Options,
+				IsHeadModule:   false,
 				EnabledModules: payload.EnabledModules,
 				PayloadVersion: payload.PayloadVersion,
 			})

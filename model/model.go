@@ -20,6 +20,7 @@ type EventMetadata struct {
 type TaskPayload struct {
 	OssPath        string          `json:"oss_path"`
 	Options        json.RawMessage `json:"options,omitempty"`
+	IsHeadModule   bool            `json:"is_head_module,omitempty"`
 	EnabledModules []string        `json:"enabled_modules,omitempty"`
 	PayloadVersion string          `json:"payload_version,omitempty"`
 }

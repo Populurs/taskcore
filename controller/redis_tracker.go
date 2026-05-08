@@ -87,9 +87,9 @@ func (rt *RedisTracker) RegisterModule(workTaskID uint32) error {
 	return err
 }
 
-func (rt *RedisTracker) IsHeadModule() bool {
-	return len(rt.modulesRelayOn) == 0
-}
+//func (rt *RedisTracker) IsHeadModule() bool {
+//	return len(rt.modulesRelayOn) == 0
+//}
 
 func (rt *RedisTracker) IncrTotal(workTaskID uint32) error {
 	return rt.incrTotal(workTaskID, 1)
@@ -138,7 +138,7 @@ func (rt *RedisTracker) IsCurrentModuleDone(workTaskID uint32, payload model.Tas
 		return false
 	}
 
-	if rt.IsHeadModule() {
+	if payload.IsHeadModule {
 		return totalVal > 0 && doneVal >= totalVal
 	}
 
