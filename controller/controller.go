@@ -73,7 +73,7 @@ func InitDealer(baseConf *config.BaseConfig, logger *log.Logger, handler TaskHan
 		concurrency = 1
 	}
 
-	tracker, err := NewRedisTracker(baseConf.Data.Redis, dc.ModuleName, baseConf.ModulesRelayOn, logger)
+	tracker, err := NewRedisTracker(baseConf.Data.Redis, dc.ModuleName, logger)
 	if err != nil {
 		logger.Warn("Redis tracker disabled", zap.Error(err))
 		tracker = nil
@@ -270,11 +270,10 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 
 	hasRelay := len(d.conf.TopicWhoRelayOn) > 0 && !d.noEnabledDownstream(payload)
 	metadata.EventType = d.dc.ModuleName
+	metadata.SourceModule = d.dc.ModuleName
 	inputShardPath := extractShardPath(objectKey)
 	var shardSeq atomic.Int64
-
-	var downstreamShardMu sync.Mutex
-	downstreamShardCounts := make(map[string]int64)
+	var feedbackShardSeq atomic.Int64
 
 	flushRelayShard := func(buf []string) error {
 		if len(buf) == 0 {
@@ -327,10 +326,15 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 				d.logger.Error("publish relay event error", zap.String("topic", nextTopic), zap.Error(pubErr))
 				continue
 			}
-
-			downstreamShardMu.Lock()
-			downstreamShardCounts[downstreamModule]++
-			downstreamShardMu.Unlock()
+			if d.tracker != nil {
+				if err := d.tracker.MarkDoneForDownstream(metadata.WorkTaskID, map[string]int64{downstreamModule: 1}); err != nil {
+					d.logger.Error("RedisTracker.MarkDoneForDownstream failed",
+						zap.Uint32("work_task_id", metadata.WorkTaskID),
+						zap.String("downstream", downstreamModule),
+						zap.Error(err),
+					)
+				}
+			}
 		}
 		return nil
 	}
@@ -430,7 +434,7 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 					zap.Any("results", results),
 				)
 
-				if !hasRelay || len(results) == 0 {
+				if len(results) == 0 {
 					return
 				}
 				if ctx.Err() != nil || isStopped() {
@@ -445,26 +449,25 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 						cleaned = append(cleaned, r)
 					}
 				}
+				if len(cleaned) == 0 {
+					return
+				}
 
 				for i := 0; i < len(cleaned); i += d.conf.RelayShardMaxItems {
 					end := i + d.conf.RelayShardMaxItems
 					if end > len(cleaned) {
 						end = len(cleaned)
 					}
-					if flushErr := flushRelayShard(cleaned[i:end]); flushErr != nil {
-						d.logger.Error("flush relay shard error", zap.String("target", t), zap.Error(flushErr))
-						return
+					shardResults := append([]string(nil), cleaned[i:end]...)
+					if hasRelay {
+						if flushErr := flushRelayShard(shardResults); flushErr != nil {
+							d.logger.Error("flush relay shard error", zap.String("target", t), zap.Error(flushErr))
+							return
+						}
 					}
 					if d.conf.EnableResultFeedback && len(d.conf.TopicResultFeedback) > 0 {
-						shardResults := append([]string(nil), cleaned[i:end]...)
-						go func(items []string) {
-							select {
-							case <-ctx.Done():
-								return
-							default:
-								d.sendResultFeedback(ctx, metadata, items)
-							}
-						}(shardResults)
+						feedbackShardID := int(feedbackShardSeq.Add(1) - 1)
+						d.sendResultFeedback(ctx, metadata, shardResults, feedbackShardID)
 					}
 				}
 			}(target)
@@ -497,23 +500,6 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 				)
 			}
 
-			if hasRelay {
-				downstreamShardMu.Lock()
-				counts := make(map[string]int64, len(downstreamShardCounts))
-				for k, v := range downstreamShardCounts {
-					counts[k] = v
-				}
-				downstreamShardMu.Unlock()
-				if len(counts) > 0 {
-					if err := d.tracker.MarkDoneForDownstream(metadata.WorkTaskID, counts); err != nil {
-						d.logger.Error("RedisTracker.MarkDoneForDownstream failed",
-							zap.Uint32("work_task_id", metadata.WorkTaskID),
-							zap.Error(err),
-						)
-					}
-				}
-			}
-
 			if !isStopped() && d.tracker.IsCurrentModuleDone(metadata.WorkTaskID, payload) {
 				if err := d.tracker.SetStatus(metadata.WorkTaskID, "completed"); err != nil {
 					d.logger.Error("failed to mark current module completed",
@@ -528,7 +514,7 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 	return nil
 }
 
-func (d *TaskDealer) sendResultFeedback(ctx context.Context, metadata model.EventMetadata, result []string) {
+func (d *TaskDealer) sendResultFeedback(ctx context.Context, metadata model.EventMetadata, result []string, shardID int) {
 	var ossPath string
 	if len(d.conf.TopicResultFeedback) == 0 {
 		d.logger.Debug("result feedback disabled, skip sending",
@@ -546,9 +532,9 @@ func (d *TaskDealer) sendResultFeedback(ctx context.Context, metadata model.Even
 
 	taskKey := model.ResultKeyFromMetadata(&metadata)
 	if d.conf.AliyunOSS.BasePath == "" {
-		ossPath = filepath.Join(d.dc.DefaultOSSBasePath, taskKey)
+		ossPath = filepath.Join(d.dc.DefaultOSSBasePath, taskKey, fmt.Sprintf("feedback_%d.json", shardID))
 	} else {
-		ossPath = filepath.Join(d.conf.AliyunOSS.BasePath, taskKey)
+		ossPath = filepath.Join(d.conf.AliyunOSS.BasePath, taskKey, fmt.Sprintf("feedback_%d.json", shardID))
 	}
 
 	resultBuf, err := model.JoinJSONStrings(result)

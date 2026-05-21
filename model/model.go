@@ -8,13 +8,14 @@ import (
 )
 
 type EventMetadata struct {
-	EventType   string `json:"event_type"`
-	TenantID    uint32 `json:"tenant_id"`
-	UserID      uint32 `json:"user_id"`
-	TaskID      uint32 `json:"task_id"`
-	WorkTaskID  uint32 `json:"work_task_id"`
-	CompanyID   uint32 `json:"company_id"`
-	CompanyName string `json:"company_name"`
+	EventType    string `json:"event_type"`
+	SourceModule string `json:"source_module"`
+	TenantID     uint32 `json:"tenant_id"`
+	UserID       uint32 `json:"user_id"`
+	TaskID       uint32 `json:"task_id"`
+	WorkTaskID   uint32 `json:"work_task_id"`
+	CompanyID    uint32 `json:"company_id"`
+	CompanyName  string `json:"company_name"`
 }
 
 type TaskPayload struct {
@@ -53,6 +54,7 @@ func BytesTrimSpace(v []byte) []byte {
 func MapToEventMetadata(m map[string]string) (*EventMetadata, error) {
 	em := &EventMetadata{}
 	em.EventType = m["event_type"]
+	em.SourceModule = m["source_module"]
 	em.CompanyName = m["company_name"]
 
 	if val, ok := m["tenant_id"]; ok && val != "" {
@@ -103,13 +105,14 @@ func EventMetadataToMap(em *EventMetadata) map[string]string {
 		return map[string]string{}
 	}
 	return map[string]string{
-		"event_type":   em.EventType,
-		"tenant_id":    strconv.FormatUint(uint64(em.TenantID), 10),
-		"user_id":      strconv.FormatUint(uint64(em.UserID), 10),
-		"task_id":      strconv.FormatUint(uint64(em.TaskID), 10),
-		"work_task_id": strconv.FormatUint(uint64(em.WorkTaskID), 10),
-		"company_id":   strconv.FormatUint(uint64(em.CompanyID), 10),
-		"company_name": em.CompanyName,
+		"event_type":    em.EventType,
+		"source_module": em.SourceModule,
+		"tenant_id":     strconv.FormatUint(uint64(em.TenantID), 10),
+		"user_id":       strconv.FormatUint(uint64(em.UserID), 10),
+		"task_id":       strconv.FormatUint(uint64(em.TaskID), 10),
+		"work_task_id":  strconv.FormatUint(uint64(em.WorkTaskID), 10),
+		"company_id":    strconv.FormatUint(uint64(em.CompanyID), 10),
+		"company_name":  em.CompanyName,
 	}
 }
 

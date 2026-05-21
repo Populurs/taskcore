@@ -20,16 +20,15 @@ const defaultTTL = 24 * time.Hour
 // RedisTracker updates Redis keys that the scheduler polls.
 // Key format mirrors scheduler/internal/rediskeys exactly.
 type RedisTracker struct {
-	rdb            *redis.Client
-	moduleName     string
-	modulesRelayOn []string
-	ttl            time.Duration
-	logger         *log.Logger
-	registered     sync.Map
+	rdb        *redis.Client
+	moduleName string
+	ttl        time.Duration
+	logger     *log.Logger
+	registered sync.Map
 }
 
 // NewRedisTracker creates a tracker. Returns (nil, nil) when addr is empty.
-func NewRedisTracker(conf config.RedisConfig, moduleName string, modulesRelayOn []string, logger *log.Logger) (*RedisTracker, error) {
+func NewRedisTracker(conf config.RedisConfig, moduleName string, logger *log.Logger) (*RedisTracker, error) {
 	if conf.Addr == "" {
 		return nil, nil
 	}
@@ -54,11 +53,10 @@ func NewRedisTracker(conf config.RedisConfig, moduleName string, modulesRelayOn 
 	}
 
 	return &RedisTracker{
-		rdb:            rdb,
-		moduleName:     strings.TrimSpace(moduleName),
-		modulesRelayOn: append([]string(nil), modulesRelayOn...),
-		ttl:            ttl,
-		logger:         logger,
+		rdb:        rdb,
+		moduleName: normalizeModuleName(moduleName),
+		ttl:        ttl,
+		logger:     logger,
 	}, nil
 }
 
@@ -86,10 +84,6 @@ func (rt *RedisTracker) RegisterModule(workTaskID uint32) error {
 	}
 	return err
 }
-
-//func (rt *RedisTracker) IsHeadModule() bool {
-//	return len(rt.modulesRelayOn) == 0
-//}
 
 func (rt *RedisTracker) IncrTotal(workTaskID uint32) error {
 	return rt.incrTotal(workTaskID, 1)
@@ -142,7 +136,7 @@ func (rt *RedisTracker) IsCurrentModuleDone(workTaskID uint32, payload model.Tas
 		return totalVal > 0 && doneVal >= totalVal
 	}
 
-	expectedTotal, allDone, err := rt.expectedTotalFromUpstreams(ctx, workTaskID, payload)
+	expectedTotal, allDone, err := rt.expectedTotalFromUpstreams(ctx, workTaskID)
 	if err != nil || !allDone {
 		return false
 	}
@@ -199,6 +193,37 @@ func (rt *RedisTracker) IsStopped(workTaskID uint32) bool {
 	return exists > 0
 }
 
+func (rt *RedisTracker) LoadUpstreams(workTaskID uint32, module string) ([]string, error) {
+	ctx := context.Background()
+	module = normalizeModuleName(module)
+	if module == "" {
+		return nil, nil
+	}
+
+	items, err := rt.rdb.SMembers(ctx, rt.upstreamsKey(workTaskID, module)).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]struct{}, len(items))
+	upstreams := make([]string, 0, len(items))
+	for _, item := range items {
+		moduleName := normalizeModuleName(item)
+		if moduleName == "" {
+			continue
+		}
+		if _, ok := seen[moduleName]; ok {
+			continue
+		}
+		seen[moduleName] = struct{}{}
+		upstreams = append(upstreams, moduleName)
+	}
+	return upstreams, nil
+}
+
 func (rt *RedisTracker) MarkDoneForDownstream(workTaskID uint32, shardCounts map[string]int64) error {
 	ctx := context.Background()
 	var firstErr error
@@ -208,15 +233,18 @@ func (rt *RedisTracker) MarkDoneForDownstream(workTaskID uint32, shardCounts map
 			continue
 		}
 
-		downstream = strings.TrimSpace(downstream)
+		downstream = normalizeModuleName(downstream)
 		if downstream == "" {
 			continue
 		}
 
 		pipe := rt.rdb.Pipeline()
+		upstreamsKey := rt.upstreamsKey(workTaskID, downstream)
 		flagKey := rt.upstreamDoneKey(workTaskID, downstream, rt.moduleName)
 		modulesKey := rt.modulesKey(workTaskID)
 
+		pipe.SAdd(ctx, upstreamsKey, rt.moduleName)
+		pipe.Expire(ctx, upstreamsKey, rt.ttl)
 		pipe.IncrBy(ctx, flagKey, count)
 		pipe.Expire(ctx, flagKey, rt.ttl)
 		pipe.Expire(ctx, modulesKey, rt.ttl)
@@ -235,30 +263,6 @@ func (rt *RedisTracker) MarkDoneForDownstream(workTaskID uint32, shardCounts map
 	}
 
 	return firstErr
-}
-
-func (rt *RedisTracker) effectiveUpstreams(payload model.TaskPayload) []string {
-	if len(rt.modulesRelayOn) == 0 {
-		return nil
-	}
-
-	seen := make(map[string]struct{}, len(rt.modulesRelayOn))
-	upstreams := make([]string, 0, len(rt.modulesRelayOn))
-	for _, item := range rt.modulesRelayOn {
-		module := strings.TrimSpace(strings.ToLower(item))
-		if module == "" {
-			continue
-		}
-		if !payload.IsModuleEnabled(module) {
-			continue
-		}
-		if _, ok := seen[module]; ok {
-			continue
-		}
-		seen[module] = struct{}{}
-		upstreams = append(upstreams, module)
-	}
-	return upstreams
 }
 
 func (rt *RedisTracker) loadCurrentProgress(ctx context.Context, workTaskID uint32) (done int64, total int64, err error) {
@@ -283,8 +287,11 @@ func (rt *RedisTracker) loadCurrentProgress(ctx context.Context, workTaskID uint
 	return doneVal, totalVal, nil
 }
 
-func (rt *RedisTracker) expectedTotalFromUpstreams(ctx context.Context, workTaskID uint32, payload model.TaskPayload) (int64, bool, error) {
-	upstreams := rt.effectiveUpstreams(payload)
+func (rt *RedisTracker) expectedTotalFromUpstreams(ctx context.Context, workTaskID uint32) (int64, bool, error) {
+	upstreams, err := rt.LoadUpstreams(workTaskID, rt.moduleName)
+	if err != nil {
+		return 0, false, err
+	}
 	if len(upstreams) == 0 {
 		return 0, false, nil
 	}
@@ -336,6 +343,10 @@ func parseInt64Cmd(cmd *redis.StringCmd) (int64, error) {
 	return strconv.ParseInt(val, 10, 64)
 }
 
+func normalizeModuleName(name string) string {
+	return strings.TrimSpace(strings.ToLower(name))
+}
+
 func (rt *RedisTracker) modulesKey(workTaskID uint32) string {
 	return fmt.Sprintf("wt:%d:modules", workTaskID)
 }
@@ -348,8 +359,12 @@ func (rt *RedisTracker) stopKey(workTaskID uint32) string {
 	return fmt.Sprintf("wt:%d:stop", workTaskID)
 }
 
+func (rt *RedisTracker) upstreamsKey(workTaskID uint32, module string) string {
+	return fmt.Sprintf("wt:%d:%s:upstreams", workTaskID, normalizeModuleName(module))
+}
+
 func (rt *RedisTracker) upstreamStatusKey(workTaskID uint32, upstream string) string {
-	return fmt.Sprintf("wt:%d:%s:status", workTaskID, upstream)
+	return fmt.Sprintf("wt:%d:%s:status", workTaskID, normalizeModuleName(upstream))
 }
 
 func (rt *RedisTracker) shardsTotalKey(workTaskID uint32) string {
@@ -361,5 +376,5 @@ func (rt *RedisTracker) shardsDoneKey(workTaskID uint32) string {
 }
 
 func (rt *RedisTracker) upstreamDoneKey(workTaskID uint32, downstream, upstream string) string {
-	return fmt.Sprintf("wt:%d:%s:upstream_done:%s", workTaskID, downstream, upstream)
+	return fmt.Sprintf("wt:%d:%s:upstream_done:%s", workTaskID, normalizeModuleName(downstream), normalizeModuleName(upstream))
 }
