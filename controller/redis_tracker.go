@@ -145,6 +145,10 @@ func (rt *RedisTracker) IsCurrentModuleDone(workTaskID uint32, payload model.Tas
 }
 
 func (rt *RedisTracker) SetStatus(workTaskID uint32, status string) error {
+	if normalizeModuleName(status) == "completed" {
+		return rt.SetCompleted(workTaskID)
+	}
+
 	ctx := context.Background()
 	pipe := rt.rdb.Pipeline()
 
@@ -152,6 +156,22 @@ func (rt *RedisTracker) SetStatus(workTaskID uint32, status string) error {
 	statusKey := rt.statusKey(workTaskID)
 
 	pipe.Set(ctx, statusKey, status, rt.ttl)
+	pipe.Expire(ctx, modulesKey, rt.ttl)
+
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func (rt *RedisTracker) SetCompleted(workTaskID uint32) error {
+	ctx := context.Background()
+	pipe := rt.rdb.Pipeline()
+
+	modulesKey := rt.modulesKey(workTaskID)
+	statusKey := rt.statusKey(workTaskID)
+	outputsClosedKey := rt.outputsClosedKey(workTaskID)
+
+	pipe.Set(ctx, statusKey, "completed", rt.ttl)
+	pipe.Set(ctx, outputsClosedKey, "1", rt.ttl)
 	pipe.Expire(ctx, modulesKey, rt.ttl)
 
 	_, err := pipe.Exec(ctx)
@@ -377,4 +397,8 @@ func (rt *RedisTracker) shardsDoneKey(workTaskID uint32) string {
 
 func (rt *RedisTracker) upstreamDoneKey(workTaskID uint32, downstream, upstream string) string {
 	return fmt.Sprintf("wt:%d:%s:upstream_done:%s", workTaskID, normalizeModuleName(downstream), normalizeModuleName(upstream))
+}
+
+func (rt *RedisTracker) outputsClosedKey(workTaskID uint32) string {
+	return fmt.Sprintf("wt:%d:%s:outputs_closed", workTaskID, rt.moduleName)
 }

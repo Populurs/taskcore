@@ -501,7 +501,7 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			}
 
 			if !isStopped() && d.tracker.IsCurrentModuleDone(metadata.WorkTaskID, payload) {
-				if err := d.tracker.SetStatus(metadata.WorkTaskID, "completed"); err != nil {
+				if err := d.tracker.SetCompleted(metadata.WorkTaskID); err != nil {
 					d.logger.Error("failed to mark current module completed",
 						zap.Uint32("work_task_id", metadata.WorkTaskID),
 						zap.Error(err),
