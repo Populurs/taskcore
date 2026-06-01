@@ -17,6 +17,27 @@ import (
 
 const defaultTTL = 24 * time.Hour
 
+const uniqueCounterLua = `
+local added = redis.call("SADD", KEYS[1], ARGV[1])
+if added == 1 then
+	redis.call("INCRBY", KEYS[2], ARGV[2])
+end
+redis.call("EXPIRE", KEYS[1], ARGV[3])
+redis.call("EXPIRE", KEYS[2], ARGV[3])
+for i = 3, #KEYS do
+	redis.call("EXPIRE", KEYS[i], ARGV[3])
+end
+local value = redis.call("GET", KEYS[2])
+if not value then
+	value = redis.call("SCARD", KEYS[1])
+	redis.call("SET", KEYS[2], value)
+	redis.call("EXPIRE", KEYS[2], ARGV[3])
+end
+return {added, value}
+`
+
+var uniqueCounterScript = redis.NewScript(uniqueCounterLua)
+
 // RedisTracker updates Redis keys that the scheduler polls.
 // Key format mirrors scheduler/internal/rediskeys exactly.
 type RedisTracker struct {
@@ -85,44 +106,39 @@ func (rt *RedisTracker) RegisterModule(workTaskID uint32) error {
 	return err
 }
 
-func (rt *RedisTracker) IncrTotal(workTaskID uint32) error {
-	return rt.incrTotal(workTaskID, 1)
-}
+func (rt *RedisTracker) IncrTotal(workTaskID uint32, shardID string) error {
+	shardID = strings.TrimSpace(shardID)
+	if shardID == "" {
+		return fmt.Errorf("shard id is empty")
+	}
 
-func (rt *RedisTracker) incrTotal(workTaskID uint32, delta int64) error {
 	ctx := context.Background()
-	pipe := rt.rdb.Pipeline()
-
 	modulesKey := rt.modulesKey(workTaskID)
 	statusKey := rt.statusKey(workTaskID)
+	receivedShardsKey := rt.receivedShardsKey(workTaskID)
 	totalKey := rt.shardsTotalKey(workTaskID)
 
-	pipe.IncrBy(ctx, totalKey, delta)
-	pipe.Expire(ctx, totalKey, rt.ttl)
-	pipe.Expire(ctx, modulesKey, rt.ttl)
-	pipe.Expire(ctx, statusKey, rt.ttl)
-
-	_, err := pipe.Exec(ctx)
+	_, _, err := rt.recordUniqueCounter(ctx, receivedShardsKey, totalKey, shardID, 1, modulesKey, statusKey)
 	return err
 }
 
-func (rt *RedisTracker) OnShardDone(workTaskID uint32) (int64, error) {
-	ctx := context.Background()
-	pipe := rt.rdb.Pipeline()
+func (rt *RedisTracker) OnShardDone(workTaskID uint32, shardID string) (int64, error) {
+	shardID = strings.TrimSpace(shardID)
+	if shardID == "" {
+		return 0, fmt.Errorf("shard id is empty")
+	}
 
+	ctx := context.Background()
 	modulesKey := rt.modulesKey(workTaskID)
 	statusKey := rt.statusKey(workTaskID)
+	doneShardsKey := rt.doneShardsKey(workTaskID)
 	doneKey := rt.shardsDoneKey(workTaskID)
 
-	incrCmd := pipe.Incr(ctx, doneKey)
-	pipe.Expire(ctx, doneKey, rt.ttl)
-	pipe.Expire(ctx, modulesKey, rt.ttl)
-	pipe.Expire(ctx, statusKey, rt.ttl)
-
-	if _, err := pipe.Exec(ctx); err != nil {
+	value, _, err := rt.recordUniqueCounter(ctx, doneShardsKey, doneKey, shardID, 1, modulesKey, statusKey)
+	if err != nil {
 		return 0, err
 	}
-	return incrCmd.Val(), nil
+	return value, nil
 }
 
 func (rt *RedisTracker) IsCurrentModuleDone(workTaskID uint32, payload model.TaskPayload) bool {
@@ -244,9 +260,13 @@ func (rt *RedisTracker) LoadUpstreams(workTaskID uint32, module string) ([]strin
 	return upstreams, nil
 }
 
-func (rt *RedisTracker) MarkDoneForDownstream(workTaskID uint32, shardCounts map[string]int64) error {
+func (rt *RedisTracker) MarkDoneForDownstream(workTaskID uint32, shardCounts map[string]int64, relayShardID string) error {
 	ctx := context.Background()
 	var firstErr error
+	relayShardID = strings.TrimSpace(relayShardID)
+	if relayShardID == "" {
+		return fmt.Errorf("relay shard id is empty")
+	}
 
 	for downstream, count := range shardCounts {
 		if count <= 0 {
@@ -258,18 +278,28 @@ func (rt *RedisTracker) MarkDoneForDownstream(workTaskID uint32, shardCounts map
 			continue
 		}
 
-		pipe := rt.rdb.Pipeline()
 		upstreamsKey := rt.upstreamsKey(workTaskID, downstream)
 		flagKey := rt.upstreamDoneKey(workTaskID, downstream, rt.moduleName)
+		doneShardsKey := rt.upstreamDoneShardsKey(workTaskID, downstream, rt.moduleName)
 		modulesKey := rt.modulesKey(workTaskID)
 
+		pipe := rt.rdb.Pipeline()
 		pipe.SAdd(ctx, upstreamsKey, rt.moduleName)
 		pipe.Expire(ctx, upstreamsKey, rt.ttl)
-		pipe.IncrBy(ctx, flagKey, count)
-		pipe.Expire(ctx, flagKey, rt.ttl)
-		pipe.Expire(ctx, modulesKey, rt.ttl)
-
 		if _, err := pipe.Exec(ctx); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			rt.logger.Error("RedisTracker.MarkDoneForDownstream failed",
+				zap.Uint32("work_task_id", workTaskID),
+				zap.String("downstream", downstream),
+				zap.Int64("count", count),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		if _, _, err := rt.recordUniqueCounter(ctx, doneShardsKey, flagKey, relayShardID, count, upstreamsKey, modulesKey); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -283,6 +313,51 @@ func (rt *RedisTracker) MarkDoneForDownstream(workTaskID uint32, shardCounts map
 	}
 
 	return firstErr
+}
+
+func (rt *RedisTracker) recordUniqueCounter(ctx context.Context, setKey, counterKey, member string, delta int64, expireKeys ...string) (int64, bool, error) {
+	keys := make([]string, 0, 2+len(expireKeys))
+	keys = append(keys, setKey, counterKey)
+	keys = append(keys, expireKeys...)
+
+	ttlSeconds := int64(rt.ttl / time.Second)
+	if ttlSeconds <= 0 {
+		ttlSeconds = 1
+	}
+
+	result, err := uniqueCounterScript.Run(ctx, rt.rdb, keys, member, delta, ttlSeconds).Result()
+	if err != nil {
+		return 0, false, err
+	}
+
+	items, ok := result.([]interface{})
+	if !ok || len(items) != 2 {
+		return 0, false, fmt.Errorf("unexpected redis unique counter result: %v", result)
+	}
+
+	added, err := redisResultInt64(items[0])
+	if err != nil {
+		return 0, false, err
+	}
+	value, err := redisResultInt64(items[1])
+	if err != nil {
+		return 0, false, err
+	}
+
+	return value, added == 1, nil
+}
+
+func redisResultInt64(value interface{}) (int64, error) {
+	switch v := value.(type) {
+	case int64:
+		return v, nil
+	case string:
+		return strconv.ParseInt(v, 10, 64)
+	case []byte:
+		return strconv.ParseInt(string(v), 10, 64)
+	default:
+		return 0, fmt.Errorf("unexpected redis integer value %T: %v", value, value)
+	}
 }
 
 func (rt *RedisTracker) loadCurrentProgress(ctx context.Context, workTaskID uint32) (done int64, total int64, err error) {
@@ -395,8 +470,20 @@ func (rt *RedisTracker) shardsDoneKey(workTaskID uint32) string {
 	return fmt.Sprintf("wt:%d:%s:shards:done", workTaskID, rt.moduleName)
 }
 
+func (rt *RedisTracker) receivedShardsKey(workTaskID uint32) string {
+	return fmt.Sprintf("wt:%d:%s:received_shards", workTaskID, rt.moduleName)
+}
+
+func (rt *RedisTracker) doneShardsKey(workTaskID uint32) string {
+	return fmt.Sprintf("wt:%d:%s:done_shards", workTaskID, rt.moduleName)
+}
+
 func (rt *RedisTracker) upstreamDoneKey(workTaskID uint32, downstream, upstream string) string {
 	return fmt.Sprintf("wt:%d:%s:upstream_done:%s", workTaskID, normalizeModuleName(downstream), normalizeModuleName(upstream))
+}
+
+func (rt *RedisTracker) upstreamDoneShardsKey(workTaskID uint32, downstream, upstream string) string {
+	return fmt.Sprintf("wt:%d:%s:upstream_done_shards:%s", workTaskID, normalizeModuleName(downstream), normalizeModuleName(upstream))
 }
 
 func (rt *RedisTracker) outputsClosedKey(workTaskID uint32) string {

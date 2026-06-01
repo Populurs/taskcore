@@ -128,7 +128,7 @@ func (d *TaskDealer) newMessageHandler() eventbus.EventHandler {
 				zap.Any("metadata", metadata),
 				zap.Error(err),
 			)
-			return nil
+			return err
 		}
 		return nil
 	}
@@ -213,18 +213,21 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 	if objectKey == "" {
 		return fmt.Errorf("oss_path is empty")
 	}
+	// payload.OssPath is the stable identity of this input shard across retries.
 
 	taskKey := model.TaskKey(&metadata)
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancels.Store(taskKey, cancel)
+	defer func() {
+		d.cancels.Delete(taskKey)
+		cancel()
+	}()
 
 	isStopped := func() bool {
 		return d.tracker != nil && d.tracker.IsStopped(metadata.WorkTaskID)
 	}
 
 	if isStopped() {
-		cancel()
-		d.cancels.Delete(taskKey)
 		d.logger.Info("work task already stopped, skip event",
 			zap.String("task_key", taskKey),
 			zap.String("event_id", eventID),
@@ -244,14 +247,17 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 				zap.Uint32("work_task_id", metadata.WorkTaskID),
 				zap.Error(err),
 			)
+			return err
 		}
 
 		if !payload.IsHeadModule {
-			if err := d.tracker.IncrTotal(metadata.WorkTaskID); err != nil {
+			if err := d.tracker.IncrTotal(metadata.WorkTaskID, objectKey); err != nil {
 				d.logger.Error("RedisTracker total update failed",
 					zap.Uint32("work_task_id", metadata.WorkTaskID),
+					zap.String("shard_id", objectKey),
 					zap.Error(err),
 				)
+				return err
 			}
 		}
 	}
@@ -262,8 +268,6 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 	}
 	obj, err := d.ossClient.GetObject(ctx, req)
 	if err != nil {
-		d.cancels.Delete(taskKey)
-		cancel()
 		return fmt.Errorf("get object error(bucket=%s,key=%s): %w", bucket, objectKey, err)
 	}
 	defer obj.Body.Close()
@@ -324,15 +328,19 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			})
 			if pubErr := d.eb.Publish(ctx, nextTopic, nextPayload, model.EventMetadataToMap(&metadata)); pubErr != nil {
 				d.logger.Error("publish relay event error", zap.String("topic", nextTopic), zap.Error(pubErr))
-				continue
+				return fmt.Errorf("publish relay event topic=%s: %w", nextTopic, pubErr)
 			}
 			if d.tracker != nil {
-				if err := d.tracker.MarkDoneForDownstream(metadata.WorkTaskID, map[string]int64{downstreamModule: 1}); err != nil {
+				// obKey deduplicates the same relay OSS shard; it is not a full exactly-once guarantee
+				// if concurrent target completion changes result ordering across retries.
+				if err := d.tracker.MarkDoneForDownstream(metadata.WorkTaskID, map[string]int64{downstreamModule: 1}, obKey); err != nil {
 					d.logger.Error("RedisTracker.MarkDoneForDownstream failed",
 						zap.Uint32("work_task_id", metadata.WorkTaskID),
 						zap.String("downstream", downstreamModule),
+						zap.String("relay_shard_id", obKey),
 						zap.Error(err),
 					)
+					return err
 				}
 			}
 		}
@@ -351,8 +359,6 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 			break
 		}
 		if readErr != nil {
-			d.cancels.Delete(taskKey)
-			cancel()
 			return fmt.Errorf("read line error: %w", readErr)
 		}
 	}
@@ -362,155 +368,176 @@ func (d *TaskDealer) readOSS(ctx context.Context, eventID string, payload model.
 	startTime := time.Now()
 	totalTargets := len(targets)
 
-	go func() {
-		defer func() {
-			d.cancels.Delete(taskKey)
-			cancel()
-		}()
-
-		var msgWg sync.WaitGroup
-
-	loop:
-		for _, target := range targets {
-			if ctx.Err() != nil || isStopped() {
-				cancel()
-				d.logger.Info("task cancelled, skip remaining targets", zap.String("task_key", taskKey))
-				break
-			}
-
-			select {
-			case d.sem <- struct{}{}:
-			case <-ctx.Done():
-				d.logger.Info("task cancelled while waiting for semaphore", zap.String("task_key", taskKey))
-				break loop
-			}
-
-			msgWg.Add(1)
-			d.wg.Add(1)
-			go func(t string) {
-				defer func() {
-					<-d.sem
-					current := d.activeTargets.Add(-1)
-					completed := d.completedCount.Add(1)
-					d.logger.Info("target done",
-						zap.String("target", t),
-						zap.Int64("active_targets", current),
-						zap.Int64("completed", completed),
-						zap.Int("total", totalTargets),
-						zap.Duration("elapsed", time.Since(startTime)),
-					)
-					msgWg.Done()
-					d.wg.Done()
-				}()
-
-				if ctx.Err() != nil || isStopped() {
-					cancel()
-					return
-				}
-
-				current := d.activeTargets.Add(1)
-				for {
-					peak := d.peakConcurrent.Load()
-					if current <= peak || d.peakConcurrent.CompareAndSwap(peak, current) {
-						break
-					}
-				}
-
-				d.logger.Info("start handle target",
-					zap.String("target", t),
-					zap.Int64("active_targets", current),
-					zap.Int64("peak_concurrent", d.peakConcurrent.Load()),
-					zap.Int("sem_capacity", d.conf.Concurrent),
-				)
-
-				results, handleErr := d.handler.Handle(ctx, eventID, t, payload, metadata)
-				if handleErr != nil {
-					d.logger.Error("handle target error", zap.String("target", t), zap.Error(handleErr))
-					return
-				}
-				d.logger.Info("handle target done",
-					zap.String("target", t),
-					zap.Int("result_count", len(results)),
-					zap.Any("results", results),
-				)
-
-				if len(results) == 0 {
-					return
-				}
-				if ctx.Err() != nil || isStopped() {
-					cancel()
-					return
-				}
-
-				cleaned := make([]string, 0, len(results))
-				for _, r := range results {
-					r = strings.TrimSpace(r)
-					if r != "" {
-						cleaned = append(cleaned, r)
-					}
-				}
-				if len(cleaned) == 0 {
-					return
-				}
-
-				for i := 0; i < len(cleaned); i += d.conf.RelayShardMaxItems {
-					end := i + d.conf.RelayShardMaxItems
-					if end > len(cleaned) {
-						end = len(cleaned)
-					}
-					shardResults := append([]string(nil), cleaned[i:end]...)
-					if hasRelay {
-						if flushErr := flushRelayShard(shardResults); flushErr != nil {
-							d.logger.Error("flush relay shard error", zap.String("target", t), zap.Error(flushErr))
-							return
-						}
-					}
-					if d.conf.EnableResultFeedback && len(d.conf.TopicResultFeedback) > 0 {
-						feedbackShardID := int(feedbackShardSeq.Add(1) - 1)
-						d.sendResultFeedback(ctx, metadata, shardResults, feedbackShardID)
-					}
-				}
-			}(target)
-		}
-
-		msgWg.Wait()
-		d.logger.Info("all targets processed, this event accomplished",
-			zap.String("event_id", eventID),
-			zap.Int("total_targets", totalTargets),
-			zap.Int64("global_active", d.activeTargets.Load()),
-			zap.Int64("global_completed", d.completedCount.Load()),
-			zap.Int64("peak_concurrent", d.peakConcurrent.Load()),
-			zap.Int("sem_capacity", d.conf.Concurrent),
-			zap.Duration("total_elapsed", time.Since(startTime)),
-		)
-
-		if isStopped() {
-			d.logger.Info("work task stopped, skip shard completion sync",
-				zap.String("event_id", eventID),
-				zap.Uint32("work_task_id", metadata.WorkTaskID),
-			)
+	var (
+		criticalMu  sync.Mutex
+		criticalErr error
+	)
+	setCriticalErr := func(err error) {
+		if err == nil {
 			return
 		}
+		criticalMu.Lock()
+		if criticalErr == nil {
+			criticalErr = err
+			cancel()
+		}
+		criticalMu.Unlock()
+	}
+	getCriticalErr := func() error {
+		criticalMu.Lock()
+		defer criticalMu.Unlock()
+		return criticalErr
+	}
 
-		if d.tracker != nil {
-			if _, shardErr := d.tracker.OnShardDone(metadata.WorkTaskID); shardErr != nil {
-				d.logger.Error("RedisTracker.OnShardDone failed",
-					zap.Uint32("work_task_id", metadata.WorkTaskID),
-					zap.Error(shardErr),
-				)
-			}
+	var msgWg sync.WaitGroup
 
-			if !isStopped() && d.tracker.IsCurrentModuleDone(metadata.WorkTaskID, payload) {
-				if err := d.tracker.SetCompleted(metadata.WorkTaskID); err != nil {
-					d.logger.Error("failed to mark current module completed",
-						zap.Uint32("work_task_id", metadata.WorkTaskID),
-						zap.Error(err),
-					)
+loop:
+	for _, target := range targets {
+		if ctx.Err() != nil || isStopped() {
+			cancel()
+			d.logger.Info("task cancelled, skip remaining targets", zap.String("task_key", taskKey))
+			break
+		}
+
+		select {
+		case d.sem <- struct{}{}:
+		case <-ctx.Done():
+			d.logger.Info("task cancelled while waiting for semaphore", zap.String("task_key", taskKey))
+			break loop
+		}
+
+		msgWg.Add(1)
+		d.wg.Add(1)
+		go func(t string) {
+			current := d.activeTargets.Add(1)
+			for {
+				peak := d.peakConcurrent.Load()
+				if current <= peak || d.peakConcurrent.CompareAndSwap(peak, current) {
+					break
 				}
 			}
-		}
-	}()
 
+			defer func() {
+				<-d.sem
+				current := d.activeTargets.Add(-1)
+				completed := d.completedCount.Add(1)
+				d.logger.Info("target done",
+					zap.String("target", t),
+					zap.Int64("active_targets", current),
+					zap.Int64("completed", completed),
+					zap.Int("total", totalTargets),
+					zap.Duration("elapsed", time.Since(startTime)),
+				)
+				msgWg.Done()
+				d.wg.Done()
+			}()
+
+			if ctx.Err() != nil || isStopped() {
+				cancel()
+				return
+			}
+
+			d.logger.Info("start handle target",
+				zap.String("target", t),
+				zap.Int64("active_targets", current),
+				zap.Int64("peak_concurrent", d.peakConcurrent.Load()),
+				zap.Int("sem_capacity", d.conf.Concurrent),
+			)
+
+			results, handleErr := d.handler.Handle(ctx, eventID, t, payload, metadata)
+			if handleErr != nil {
+				d.logger.Error("handle target error", zap.String("target", t), zap.Error(handleErr))
+				return
+			}
+			d.logger.Info("handle target done",
+				zap.String("target", t),
+				zap.Int("result_count", len(results)),
+				zap.Any("results", results),
+			)
+
+			if len(results) == 0 {
+				return
+			}
+			if ctx.Err() != nil || isStopped() {
+				cancel()
+				return
+			}
+
+			cleaned := make([]string, 0, len(results))
+			for _, r := range results {
+				r = strings.TrimSpace(r)
+				if r != "" {
+					cleaned = append(cleaned, r)
+				}
+			}
+			if len(cleaned) == 0 {
+				return
+			}
+
+			for i := 0; i < len(cleaned); i += d.conf.RelayShardMaxItems {
+				end := i + d.conf.RelayShardMaxItems
+				if end > len(cleaned) {
+					end = len(cleaned)
+				}
+				shardResults := append([]string(nil), cleaned[i:end]...)
+				if hasRelay {
+					if flushErr := flushRelayShard(shardResults); flushErr != nil {
+						d.logger.Error("flush relay shard error", zap.String("target", t), zap.Error(flushErr))
+						setCriticalErr(flushErr)
+						return
+					}
+				}
+				if d.conf.EnableResultFeedback && len(d.conf.TopicResultFeedback) > 0 {
+					feedbackShardID := int(feedbackShardSeq.Add(1) - 1)
+					d.sendResultFeedback(ctx, metadata, shardResults, feedbackShardID)
+				}
+			}
+		}(target)
+	}
+
+	msgWg.Wait()
+	d.logger.Info("all targets processed, this event accomplished",
+		zap.String("event_id", eventID),
+		zap.Int("total_targets", totalTargets),
+		zap.Int64("global_active", d.activeTargets.Load()),
+		zap.Int64("global_completed", d.completedCount.Load()),
+		zap.Int64("peak_concurrent", d.peakConcurrent.Load()),
+		zap.Int("sem_capacity", d.conf.Concurrent),
+		zap.Duration("total_elapsed", time.Since(startTime)),
+	)
+
+	if isStopped() {
+		d.logger.Info("work task stopped, skip shard completion sync",
+			zap.String("event_id", eventID),
+			zap.Uint32("work_task_id", metadata.WorkTaskID),
+		)
+		return nil
+	}
+	if err := getCriticalErr(); err != nil {
+		return err
+	}
+
+	if d.tracker == nil {
+		return nil
+	}
+	if _, err := d.tracker.OnShardDone(metadata.WorkTaskID, objectKey); err != nil {
+		d.logger.Error("RedisTracker.OnShardDone failed",
+			zap.Uint32("work_task_id", metadata.WorkTaskID),
+			zap.String("shard_id", objectKey),
+			zap.Error(err),
+		)
+		return err
+	}
+
+	if !isStopped() && d.tracker.IsCurrentModuleDone(metadata.WorkTaskID, payload) {
+		if err := d.tracker.SetCompleted(metadata.WorkTaskID); err != nil {
+			d.logger.Error("failed to mark current module completed",
+				zap.Uint32("work_task_id", metadata.WorkTaskID),
+				zap.Error(err),
+			)
+			return err
+		}
+	}
 	return nil
 }
 
