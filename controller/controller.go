@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"io"
 	"path/filepath"
 	"strconv"
@@ -18,7 +19,6 @@ import (
 	"github.com/Populurs/taskcore/config"
 	"github.com/Populurs/taskcore/log"
 	"github.com/Populurs/taskcore/model"
-	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
 	"go.uber.org/zap"
 )
@@ -26,6 +26,10 @@ import (
 type TaskHandler interface {
 	Handle(ctx context.Context, eventID, target string, payload model.TaskPayload, metadata model.EventMetadata) ([]string, error)
 }
+
+// messageMaxAge is a local safety guard for stale queue messages.
+// Messages older than this are acked and skipped before reading OSS.
+const messageMaxAge = 7 * 24 * time.Hour
 
 type DealerConfig struct {
 	ModuleName         string
@@ -50,7 +54,11 @@ type TaskDealer struct {
 }
 
 func InitDealer(baseConf *config.BaseConfig, logger *log.Logger, handler TaskHandler, dc DealerConfig) (*TaskDealer, error) {
-	eb, err := eventbus.NewRabbitMQEventBus(baseConf.Rabbitmq.Url+baseConf.Rabbitmq.Vhost, baseConf.Rabbitmq.PrefetchCount)
+	eb, err := eventbus.NewRabbitMQEventBusWithConsumerConcurrency(
+		baseConf.Rabbitmq.Url+baseConf.Rabbitmq.Vhost,
+		baseConf.Rabbitmq.PrefetchCount,
+		baseConf.Rabbitmq.ConsumerConcurrency,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -176,6 +184,10 @@ func (d *TaskDealer) newStopHandler() eventbus.EventHandler {
 func (d *TaskDealer) handleEvent(eventID string, payload []byte, metadata map[string]string) error {
 	d.logger.Info("received message", zap.String("payload", string(payload)), zap.Any("metadata", metadata))
 
+	if d.isExpiredMessage(eventID, metadata) {
+		return nil
+	}
+
 	pl := model.TaskPayload{}
 	if err := json.Unmarshal(payload, &pl); err != nil {
 		return fmt.Errorf("failed to parse payload: %w", err)
@@ -190,6 +202,40 @@ func (d *TaskDealer) handleEvent(eventID string, payload []byte, metadata map[st
 		return fmt.Errorf("failed to read OSS: %w", err)
 	}
 	return nil
+}
+
+func (d *TaskDealer) isExpiredMessage(eventID string, metadata map[string]string) bool {
+	publishedAtRaw := strings.TrimSpace(metadata[eventbus.MetadataPublishedAtUnixMS])
+	if publishedAtRaw == "" {
+		d.logger.Warn("message missing published timestamp, continue for compatibility",
+			zap.String("event_id", eventID),
+		)
+		return false
+	}
+
+	publishedAtMS, err := strconv.ParseInt(publishedAtRaw, 10, 64)
+	if err != nil || publishedAtMS <= 0 {
+		d.logger.Warn("message has invalid published timestamp, continue for compatibility",
+			zap.String("event_id", eventID),
+			zap.String("published_at_unix_ms", publishedAtRaw),
+			zap.Error(err),
+		)
+		return false
+	}
+
+	publishedAt := time.UnixMilli(publishedAtMS)
+	age := time.Since(publishedAt)
+	if age <= messageMaxAge {
+		return false
+	}
+
+	d.logger.Warn("message exceeded max age, ack and skip",
+		zap.String("event_id", eventID),
+		zap.Time("published_at", publishedAt),
+		zap.Duration("age", age),
+		zap.Duration("max_age", messageMaxAge),
+	)
+	return true
 }
 
 func (d *TaskDealer) noEnabledDownstream(payload model.TaskPayload) bool {

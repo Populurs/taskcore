@@ -15,7 +15,12 @@ import (
 	"go.uber.org/zap"
 )
 
-const defaultTTL = 24 * time.Hour
+const (
+	defaultTTL = 24 * time.Hour
+	// stopKeyTTL must outlive normal runtime keys so delayed start messages
+	// for an already stopped work_task are skipped instead of re-executed.
+	stopKeyTTL = 14 * 24 * time.Hour
+)
 
 const uniqueCounterLua = `
 local added = redis.call("SADD", KEYS[1], ARGV[1])
@@ -208,7 +213,7 @@ func (rt *RedisTracker) SetStopped(workTaskID uint32) error {
 	modulesKey := rt.modulesKey(workTaskID)
 	stopKey := rt.stopKey(workTaskID)
 
-	pipe.Set(ctx, stopKey, "1", rt.ttl)
+	pipe.Set(ctx, stopKey, "1", stopKeyTTL)
 	if status != "completed" {
 		pipe.Set(ctx, statusKey, "stopped", rt.ttl)
 	} else {

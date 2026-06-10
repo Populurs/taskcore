@@ -29,15 +29,24 @@ func (c *BaseConfig) ApplyBaseDefaults() {
 	if c.Concurrent <= 0 {
 		c.Concurrent = 5
 	}
+	if c.Rabbitmq.ConsumerConcurrency <= 0 {
+		c.Rabbitmq.ConsumerConcurrency = 1
+	}
+	if c.Rabbitmq.PrefetchCount <= 0 {
+		c.Rabbitmq.PrefetchCount = c.Rabbitmq.ConsumerConcurrency
+	}
 	if c.RelayShardMaxItems <= 0 {
 		c.RelayShardMaxItems = 100
 	}
 }
 
 type Rabbitmq struct {
-	Url           string `yaml:"url" mapstructure:"url"`
-	Vhost         string `yaml:"vhost" mapstructure:"vhost"`
-	PrefetchCount int    `yaml:"prefetch_count" mapstructure:"prefetch_count"`
+	Url   string `yaml:"url" mapstructure:"url"`
+	Vhost string `yaml:"vhost" mapstructure:"vhost"`
+	// PrefetchCount is RabbitMQ QoS only; it limits delivered but unacked messages.
+	PrefetchCount int `yaml:"prefetch_count" mapstructure:"prefetch_count"`
+	// ConsumerConcurrency limits how many queue messages this process handles at the same time.
+	ConsumerConcurrency int `yaml:"consumer_concurrency" mapstructure:"consumer_concurrency"`
 }
 
 type LogConfig struct {
